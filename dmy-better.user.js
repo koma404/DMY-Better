@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.7.3
+// @version      0.7.4
 // @description  代码源 newoj：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
@@ -75,9 +75,10 @@
 
   const findRoot = (doc = document) => ROOTS.map(s => doc.querySelector(s)).find(Boolean);
 
-  // 等页面字体加载完。KaTeX 公式按专用字体的尺寸排版，字体没下完就截图，公式会用替代字体画出来并错位。
-  // 比赛页本身没有公式，保存整个比赛时第一题加载时 KaTeX 字体还没缓存，所以只有第一题出问题。
-  // 这里主动把 KaTeX 的所有字体都加载一遍（后面的题和 html2canvas 的副本都能直接用缓存），最多等 15 秒。
+  // 等页面字体加载完：主动把 KaTeX 的所有字体都加载一遍，最多等 15 秒。
+  // html2canvas 画字前要测量字体基线，而它是在【运行脚本的页面】（全局 document）里测量的，不是题面所在的 iframe。
+  // 保存整个比赛时这个页面是比赛页：它声明了 KaTeX 字体但页面上没有公式，字体还没加载，
+  // 测出来的是替代字体的基线，公式就会下沉、错位。测量本身会触发加载，所以只有第一题出问题。
   async function waitFonts(doc) {
     const fonts = doc.fonts;
     if (!fonts) return;
@@ -571,6 +572,7 @@
         await sleep(300);
       }
       await waitFonts(doc);
+      await waitFonts(document); // html2canvas 在比赛页里测量字体基线，见 waitFonts 的说明
       await sleep(PAGE_SETTLE_MS);
       const root = findRoot(doc);
       await Promise.race([
