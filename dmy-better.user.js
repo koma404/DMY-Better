@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.7.2
+// @version      0.7.3
 // @description  代码源 newoj：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
@@ -74,6 +74,24 @@
     .replace(/\s+/g, ' ').replace(/[. ]+$/, '').slice(0, 80) || 'problem';
 
   const findRoot = (doc = document) => ROOTS.map(s => doc.querySelector(s)).find(Boolean);
+
+  // 等页面字体加载完。KaTeX 公式按专用字体的尺寸排版，字体没下完就截图，公式会用替代字体画出来并错位。
+  // 比赛页本身没有公式，保存整个比赛时第一题加载时 KaTeX 字体还没缓存，所以只有第一题出问题。
+  // 这里主动把 KaTeX 的所有字体都加载一遍（后面的题和 html2canvas 的副本都能直接用缓存），最多等 15 秒。
+  async function waitFonts(doc) {
+    const fonts = doc.fonts;
+    if (!fonts) return;
+    await Promise.race([
+      (async () => {
+        await fonts.ready;
+        await Promise.all([...fonts]
+          .filter(f => /katex/i.test(f.family) && f.status !== 'loaded')
+          .map(f => f.load().catch(() => {})));
+        await fonts.ready;
+      })(),
+      sleep(15000),
+    ]);
+  }
 
   function toast(msg, ms = 2200) {
     const t = document.createElement('div');
@@ -517,6 +535,7 @@
       const title = info ? `${info.letter}. ${info.name}` : getTitle();
       const folder = safe(title);
 
+      await waitFonts(document);
       prog.textContent = `正在生成 PDF：${folder}`;
       const stat = newStat();
       await saveProblem(document, root, title, folder, folder, stat);
@@ -551,6 +570,7 @@
         if (Date.now() - t0 > 20000) throw new Error('等待题面超时，检查 ROOTS');
         await sleep(300);
       }
+      await waitFonts(doc);
       await sleep(PAGE_SETTLE_MS);
       const root = findRoot(doc);
       await Promise.race([
