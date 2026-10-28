@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.8.0
+// @version      0.8.1
 // @description  代码源（newoj 和旧 OJ）：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
@@ -90,29 +90,89 @@
   // 测出来的是替代字体的基线，公式就会下沉、错位。测量本身会触发加载，所以只有第一题出问题。
   // 把题面 iframe 里声明的 @font-face 复制到当前页面。旧 OJ 的比赛页没有公式，也就没声明 MathJax 字体，
   // html2canvas 在当前页面测量基线时会找不到这些字体，每道题的公式都会错位。
-  function mirrorFontFaces(doc) {
+  // 读不到内容的跨域样式表（比如 CDN 上的 KaTeX / MathJax 样式）就直接在当前页面引入同一个样式表。
+  async function mirrorFontFaces(doc) {
     if (doc === document) return;
     const css = [];
-    for (const sheet of doc.styleSheets) {
+    const links = [];
+    const collect = (sheet) => {
       let rules;
-      try { rules = sheet.cssRules; } catch (e) { continue; } // 跨域样式表读不到，跳过
+      try { rules = sheet.cssRules; } catch (e) { if (sheet.href) links.push(sheet.href); return; }
       const base = sheet.href || doc.baseURI;
       for (const r of rules) {
-        if (r.type !== 5) continue; // CSSRule.FONT_FACE_RULE
-        css.push(r.cssText.replace(/url\((['"]?)(?!data:)([^'")]+)\1\)/g,
-          (m, q, u) => { try { return `url("${new URL(u, base).href}")`; } catch (e) { return m; } }));
+        if (r.type === 3 && r.styleSheet) collect(r.styleSheet); // @import
+        else if (r.type === 4 && r.cssRules) collect({ cssRules: r.cssRules, href: sheet.href }); // @media
+        else if (r.type === 5) { // @font-face
+          css.push(r.cssText.replace(/url\((['"]?)(?!data:)([^'")]+)\1\)/g,
+            (m, q, u) => { try { return `url("${new URL(u, base).href}")`; } catch (e) { return m; } }));
+        }
+      }
+    };
+    for (const sheet of doc.styleSheets) collect(sheet);
+
+    if (css.length) {
+      let st = document.getElementById('__dmy_fonts');
+      if (!st) {
+        st = document.createElement('style');
+        st.id = '__dmy_fonts';
+        (document.head || document.documentElement).appendChild(st);
+      }
+      const have = new Set(st.textContent.split('\n'));
+      const add = css.filter(c => !have.has(c));
+      if (add.length) st.textContent += add.join('\n') + '\n';
+    }
+
+    const have = new Set([...document.querySelectorAll('link[rel~="stylesheet"]')].map(l => l.href));
+    await Promise.all(links.filter(h => /katex|mathjax|font/i.test(h) && !have.has(h)).map(href =>
+      new Promise(resolve => {
+        const l = document.createElement('link');
+        l.rel = 'stylesheet';
+        l.href = href;
+        l.onload = l.onerror = resolve;
+        (document.head || document.documentElement).appendChild(l);
+        setTimeout(resolve, 10000);
+      })));
+  }
+
+  // 调试：列出当前页面（和题面 iframe）的字体与样式表情况，复制到剪贴板
+  function fontReport(doc, label) {
+    const out = [`== ${label}：${doc.location && doc.location.href}`];
+    try {
+      out.push(`MathJax：${(() => { try { const M = unsafeWindow.MathJax; return M ? (M.version || 'yes') : '无'; } catch (e) { return '?'; } })()}，KaTeX 元素：${doc.querySelectorAll('.katex').length}，MathJax 元素：${doc.querySelectorAll('.MathJax, .MathJax_CHTML, mjx-container, .mjx-chtml').length}`);
+    } catch (e) {}
+    out.push('字体（family / status）：');
+    try { [...doc.fonts].forEach(f => out.push(`  ${f.family} ${f.style} ${f.weight} → ${f.status}`)); } catch (e) { out.push('  读取出错 ' + e.message); }
+    out.push('样式表：');
+    for (const sh of doc.styleSheets) {
+      let n = '?';
+      try { n = sh.cssRules.length; } catch (e) { n = '跨域，读不到'; }
+      out.push(`  ${sh.href || '(内联)'} 规则数：${n}`);
+    }
+    const sample = doc.querySelector('.katex, .MathJax, .MathJax_CHTML, mjx-container, .mjx-chtml');
+    if (sample) {
+      const inner = sample.querySelector('*') || sample;
+      out.push(`公式元素示例 font-family：${doc.defaultView.getComputedStyle(inner).fontFamily}`);
+      out.push(`公式元素 HTML（截断）：${sample.outerHTML.slice(0, 600)}`);
+    }
+    return out.join('\n');
+  }
+
+  async function debugFonts() {
+    const parts = [fontReport(document, '当前页面')];
+    if (isContestPage()) {
+      const list = parseProblemLinks(document);
+      if (list[0]) {
+        try {
+          const { frame, doc } = await loadProblemDoc(list[0].url);
+          parts.push(fontReport(doc, '第一题 iframe（已执行字体复制与等待）'));
+          parts.push(fontReport(document, '复制字体后的当前页面'));
+          frame.remove();
+        } catch (e) { parts.push('加载第一题失败：' + e.message); }
       }
     }
-    if (!css.length) return;
-    let st = document.getElementById('__dmy_fonts');
-    if (!st) {
-      st = document.createElement('style');
-      st.id = '__dmy_fonts';
-      (document.head || document.documentElement).appendChild(st);
-    }
-    const have = new Set(st.textContent.split('\n'));
-    const add = css.filter(c => !have.has(c));
-    if (add.length) st.textContent += add.join('\n') + '\n';
+    const text = parts.join('\n\n');
+    console.log('[DMY Better] 字体调试信息\n' + text);
+    toast(writeClipboard(text) ? '已复制字体调试信息' : '复制失败，请在控制台查看', 4000);
   }
 
   async function waitFonts(doc) {
@@ -490,11 +550,19 @@
   }
 
   function getContestTitle(tid) {
-    if (OLD_OJ) { // 旧 OJ：比赛名是页面上的大标题（排除顶部的站名）；导航里的 /contest/<id> 链接文字是「比赛主页」
-      const h = [...document.querySelectorAll('h1')]
-        .map(e => e.textContent.replace(/\s+/g, ' ').trim())
-        .find(t => t && !/Online Judge/i.test(t));
-      return h || document.title.replace(OLD_OJ_SUFFIX, '').trim() || 'contest';
+    if (OLD_OJ) {
+      // 旧 OJ：导航里的 /contest/<id> 链接文字是「比赛主页」，顶部还有站名和「Home」，都不能用。
+      // 依次取：居中的大标题 → 网页标题去掉站名 → 最长的标题文字
+      const bad = t => !t || /Online Judge/i.test(t) || /^(home|首页|比赛主页)$/i.test(t);
+      const text = e => e.textContent.replace(/\s+/g, ' ').trim();
+      const center = [...document.querySelectorAll('h1.text-center, h2.text-center, .page-header h1')]
+        .map(text).find(t => !bad(t));
+      if (center) return center;
+      const fromTitle = document.title.replace(OLD_OJ_SUFFIX, '').trim();
+      if (!bad(fromTitle)) return fromTitle;
+      const longest = [...document.querySelectorAll('h1, h2')].map(text).filter(t => !bad(t))
+        .sort((a, b) => b.length - a.length)[0];
+      return longest || 'contest';
     }
     if (tid) { // 导航栏里指向 /contest/<tid> 的链接，文字就是比赛名
       for (const a of document.querySelectorAll('a[href]')) {
@@ -629,7 +697,7 @@
         await sleep(300);
       }
       await waitFonts(doc);
-      mirrorFontFaces(doc);
+      await mirrorFontFaces(doc);
       await waitFonts(document); // html2canvas 在比赛页里测量字体基线，见 waitFonts 的说明
       await sleep(PAGE_SETTLE_MS);
       const root = findRoot(doc);
@@ -729,4 +797,5 @@
   GM_registerMenuCommand('复制题面为 Markdown', copyMarkdown);
   GM_registerMenuCommand('保存题目（PDF + 附件）', savePackage);
   GM_registerMenuCommand('保存整个比赛', saveContest);
+  GM_registerMenuCommand('调试：字体信息', debugFonts);
 })();
