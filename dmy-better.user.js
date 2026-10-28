@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.8.1
+// @version      0.8.2
 // @description  代码源（newoj 和旧 OJ）：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
@@ -29,7 +29,7 @@
   /* ================= 配置（页面结构不同时改这里） ================= */
   // 题面容器：按顺序尝试，不对就用 F12 找到题面外层元素，把选择器放到第一项
   const ROOTS = [
-    '.uoj-article', // 旧 OJ（oj.daimayuan.top，UOJ 系统）
+    '.uoj-article', 'article.top-buffer-md', '#tab-statement article', // 旧 OJ（oj.daimayuan.top，UOJ 系统）
     '.problem-content', '.problem-content-container',
     '.section__body.typo', '.typo', 'article', 'main',
   ];
@@ -158,21 +158,47 @@
   }
 
   async function debugFonts() {
-    const parts = [fontReport(document, '当前页面')];
+    const prog = toast('正在收集字体信息…', 1e9);
+    const parts = [`DMY Better ${typeof GM_info !== 'undefined' ? GM_info.script.version : '?'}`];
+    try { parts.push(fontReport(document, '当前页面')); } catch (e) { parts.push('当前页面出错：' + e.stack); }
     if (isContestPage()) {
       const list = parseProblemLinks(document);
       if (list[0]) {
         try {
           const { frame, doc } = await loadProblemDoc(list[0].url);
-          parts.push(fontReport(doc, '第一题 iframe（已执行字体复制与等待）'));
-          parts.push(fontReport(document, '复制字体后的当前页面'));
+          try { parts.push(fontReport(doc, '第一题 iframe（已执行字体复制与等待）')); } catch (e) { parts.push('iframe 出错：' + e.stack); }
+          try { parts.push(fontReport(document, '复制字体后的当前页面')); } catch (e) { parts.push('当前页面出错：' + e.stack); }
           frame.remove();
         } catch (e) { parts.push('加载第一题失败：' + e.message); }
       }
     }
-    const text = parts.join('\n\n');
-    console.log('[DMY Better] 字体调试信息\n' + text);
-    toast(writeClipboard(text) ? '已复制字体调试信息' : '复制失败，请在控制台查看', 4000);
+    prog.remove();
+    showText(parts.join('\n\n'));
+  }
+
+  // 把文字显示在页面上的面板里（加载题目要几秒，之后浏览器不再允许自动写剪贴板，只能手动复制）
+  function showText(text) {
+    console.log('[DMY Better] 调试信息\n' + text);
+    document.getElementById('__dmy_debug')?.remove();
+    const box = document.createElement('div');
+    box.id = '__dmy_debug';
+    box.style.cssText = 'position:fixed;inset:5vh 5vw;z-index:2147483647;background:#fff;border:1px solid #999;' +
+      'border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.3);display:flex;flex-direction:column;padding:10px;gap:8px';
+    const bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;gap:8px;align-items:center;font:14px sans-serif';
+    bar.innerHTML = '<b style="flex:1">调试信息（已全选，按 Ctrl+C 复制）</b>';
+    const close = document.createElement('button');
+    close.textContent = '关闭';
+    close.onclick = () => box.remove();
+    bar.appendChild(close);
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.readOnly = true;
+    ta.style.cssText = 'flex:1;font:12px/1.4 monospace;white-space:pre;resize:none';
+    box.append(bar, ta);
+    document.body.appendChild(box);
+    ta.focus();
+    ta.select();
   }
 
   async function waitFonts(doc) {
@@ -558,7 +584,8 @@
       const center = [...document.querySelectorAll('h1.text-center, h2.text-center, .page-header h1')]
         .map(text).find(t => !bad(t));
       if (center) return center;
-      const fromTitle = document.title.replace(OLD_OJ_SUFFIX, '').trim();
+      // 网页标题形如「比赛名 - 比赛主页 - 比赛 - Daimayuan Online Judge」，取第一段
+      const fromTitle = document.title.replace(OLD_OJ_SUFFIX, '').split(' - ')[0].trim();
       if (!bad(fromTitle)) return fromTitle;
       const longest = [...document.querySelectorAll('h1, h2')].map(text).filter(t => !bad(t))
         .sort((a, b) => b.length - a.length)[0];
