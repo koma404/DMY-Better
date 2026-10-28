@@ -1,13 +1,17 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.7.4
-// @description  代码源 newoj：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
+// @version      0.8.0
+// @description  代码源（newoj 和旧 OJ）：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
 // @supportURL   https://greasyfork.org/zh-CN/scripts/600021-dmy-better
 // @match        https://newoj.daimayuan.top/p/*
 // @match        https://newoj.daimayuan.top/contest/*
+// @match        http://oj.daimayuan.top/problem/*
+// @match        http://oj.daimayuan.top/contest/*
+// @match        https://oj.daimayuan.top/problem/*
+// @match        https://oj.daimayuan.top/contest/*
 // @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
 // @grant        GM_download
@@ -25,6 +29,7 @@
   /* ================= 配置（页面结构不同时改这里） ================= */
   // 题面容器：按顺序尝试，不对就用 F12 找到题面外层元素，把选择器放到第一项
   const ROOTS = [
+    '.uoj-article', // 旧 OJ（oj.daimayuan.top，UOJ 系统）
     '.problem-content', '.problem-content-container',
     '.section__body.typo', '.typo', 'article', 'main',
   ];
@@ -33,10 +38,14 @@
   // 附件链接：优先用这些选择器；全都没匹配到时，才按文件后缀/路径猜
   const ATTACH_SELECTORS = [
     'a[href*="type=additional_file"]',
+    'a[href*="download.php"]', // 旧 OJ 的「附加文件」
     '.problem-attachments a', '.attachments a', '.attachment a', 'a[download]',
   ];
   const FILE_RE = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|pdf|docx?|xlsx?|pptx?|txt|in|out|ans|cpp|c|h|py|java|mp3|mp4)$/i;
   const PATH_RE = /\/(files?|attachments?|downloads?)\//i;
+  // 代码源旧 OJ（UOJ 系统）：题目页 /problem/3259 或 /contest/431/problem/3259
+  const OLD_OJ = location.hostname === 'oj.daimayuan.top';
+  const OLD_OJ_SUFFIX = /\s*-\s*Daimayuan Online Judge\s*$/i;
   // PDF：渲染宽度(CSS px)与清晰度。宽度越小字越大；清晰度越高文件越大
   const PDF_WIDTH = 720;
   const PDF_SCALE = 2;
@@ -79,6 +88,33 @@
   // html2canvas 画字前要测量字体基线，而它是在【运行脚本的页面】（全局 document）里测量的，不是题面所在的 iframe。
   // 保存整个比赛时这个页面是比赛页：它声明了 KaTeX 字体但页面上没有公式，字体还没加载，
   // 测出来的是替代字体的基线，公式就会下沉、错位。测量本身会触发加载，所以只有第一题出问题。
+  // 把题面 iframe 里声明的 @font-face 复制到当前页面。旧 OJ 的比赛页没有公式，也就没声明 MathJax 字体，
+  // html2canvas 在当前页面测量基线时会找不到这些字体，每道题的公式都会错位。
+  function mirrorFontFaces(doc) {
+    if (doc === document) return;
+    const css = [];
+    for (const sheet of doc.styleSheets) {
+      let rules;
+      try { rules = sheet.cssRules; } catch (e) { continue; } // 跨域样式表读不到，跳过
+      const base = sheet.href || doc.baseURI;
+      for (const r of rules) {
+        if (r.type !== 5) continue; // CSSRule.FONT_FACE_RULE
+        css.push(r.cssText.replace(/url\((['"]?)(?!data:)([^'")]+)\1\)/g,
+          (m, q, u) => { try { return `url("${new URL(u, base).href}")`; } catch (e) { return m; } }));
+      }
+    }
+    if (!css.length) return;
+    let st = document.getElementById('__dmy_fonts');
+    if (!st) {
+      st = document.createElement('style');
+      st.id = '__dmy_fonts';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    const have = new Set(st.textContent.split('\n'));
+    const add = css.filter(c => !have.has(c));
+    if (add.length) st.textContent += add.join('\n') + '\n';
+  }
+
   async function waitFonts(doc) {
     const fonts = doc.fonts;
     if (!fonts) return;
@@ -86,7 +122,7 @@
       (async () => {
         await fonts.ready;
         await Promise.all([...fonts]
-          .filter(f => /katex/i.test(f.family) && f.status !== 'loaded')
+          .filter(f => /katex|mathjax|mjx/i.test(f.family) && f.status !== 'loaded')
           .map(f => f.load().catch(() => {})));
         await fonts.ready;
       })(),
@@ -105,8 +141,10 @@
     return t;
   }
 
-  const isProblemPage = () => /\/p\/[^/]+\/?$/.test(location.pathname);
-  const isContestPage = () => /^\/contest\//.test(location.pathname);
+  // 新 OJ：/p/xxx；旧 OJ：/problem/123、/contest/12/problem/123
+  const PROBLEM_PATH = /\/(p\/[^/]+|(contest\/\d+\/)?problem\/\d+)\/?$/;
+  const isProblemPage = () => PROBLEM_PATH.test(location.pathname);
+  const isContestPage = () => /^\/contest\//.test(location.pathname) && !isProblemPage();
 
   /* ================= 3. DOM -> Markdown ================= */
   const texOf = el => {
@@ -132,6 +170,8 @@
       return /mode=display/.test(node.type)
         ? `\n\n$$\n${node.textContent.trim()}\n$$\n\n`
         : `$${node.textContent.trim()}$`;
+    if (node.matches('.MathJax_CHTML, .mjx-chtml, .MathJax_SVG, .MathJax_Display, .MJX_Assistive_MathML'))
+      return ''; // 旧 OJ 的 MathJax 2 渲染结果，公式源码在旁边的 <script type="math/tex"> 里
     if (node.matches('.MathJax, .MathJax_Preview, mjx-container, style, button, svg'))
       return tag === 'mjx-container' ? `$${node.textContent.trim()}$` : '';
 
@@ -204,7 +244,7 @@
   }
 
   function copyMarkdown() {
-    if (!isProblemPage()) return toast('请在题目页（/p/…）使用');
+    if (!isProblemPage()) return toast('请在题目页使用');
     const root = findRoot();
     if (!root) return toast('没找到题面容器，请修改 ROOTS');
     const text = md(root)
@@ -330,6 +370,8 @@
       try { n = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || ''); }
       catch (e) { n = u.pathname.split('/').filter(Boolean).pop() || ''; }
     }
+    // 旧 OJ（UOJ）的「附加文件」是 download.php?type=problem&id=…，下载的是附件压缩包
+    if (/\.php$/i.test(n)) n = `${a.textContent.trim() || 'attachment'}.zip`;
     if (!/\.[A-Za-z0-9]{1,6}$/.test(n)) n = a.textContent.trim() || n || 'file';
     return n.replace(/[\\/:*?"<>|]/g, '_');
   }
@@ -366,6 +408,7 @@
   }
 
   function getTitle() {
+    if (OLD_OJ) return document.title.replace(OLD_OJ_SUFFIX, '').trim() || 'problem';
     for (const s of TITLE_SELECTORS) {
       const t = document.querySelector(s);
       const txt = t && t.textContent.replace(/\s+/g, ' ').trim();
@@ -383,19 +426,27 @@
       const m = t.match(/#\s*([A-Za-z0-9]{1,3})\s*[.．]\s*(.+?)\s*$/);
       if (m) return { letter: m[1].toUpperCase(), name: m[2] };
     }
+    if (OLD_OJ) { // 旧 OJ：比赛题目页「A. 逆序对」，普通题目页「#3259. 逆序对」
+      for (const el of document.querySelectorAll('h1,h2')) {
+        const t = el.textContent.replace(/\s+/g, ' ').trim();
+        const m = t.length <= 150 && t.match(/^(#\d+|[A-Za-z]\d?)\s*[.．]\s*(.+?)$/);
+        if (m) return { letter: m[1].replace('#', '').toUpperCase(), name: m[2] };
+      }
+    }
     return null;
   }
 
   // 解析一个文档里的比赛题目列表：[{url, letter, name}]
   function parseProblemLinks(doc) {
-    const tables = [...doc.querySelectorAll('table')].filter(t => t.querySelector('a[href*="/p/"]'));
+    const tables = [...doc.querySelectorAll('table')]
+      .filter(t => [...t.querySelectorAll('a[href]')].some(a => { try { return PROBLEM_PATH.test(new URL(a.getAttribute('href'), location.href).pathname); } catch (e) { return false; } }));
     const scope = tables[0] || doc;
     const seen = new Set();
     const out = [];
     scope.querySelectorAll('a[href]').forEach(a => {
       let u;
       try { u = new URL(a.getAttribute('href'), location.href); } catch (e) { return; }
-      if (u.origin !== location.origin || !/\/p\/[^/]+\/?$/.test(u.pathname)) return;
+      if (u.origin !== location.origin || !PROBLEM_PATH.test(u.pathname)) return;
       const key = u.pathname + u.search;
       if (seen.has(key)) return;
       seen.add(key);
@@ -439,6 +490,12 @@
   }
 
   function getContestTitle(tid) {
+    if (OLD_OJ) { // 旧 OJ：比赛名是页面上的大标题（排除顶部的站名）；导航里的 /contest/<id> 链接文字是「比赛主页」
+      const h = [...document.querySelectorAll('h1')]
+        .map(e => e.textContent.replace(/\s+/g, ' ').trim())
+        .find(t => t && !/Online Judge/i.test(t));
+      return h || document.title.replace(OLD_OJ_SUFFIX, '').trim() || 'contest';
+    }
     if (tid) { // 导航栏里指向 /contest/<tid> 的链接，文字就是比赛名
       for (const a of document.querySelectorAll('a[href]')) {
         let u;
@@ -523,7 +580,7 @@
 
   /* ================= 8. 保存当前题目 ================= */
   async function savePackage() {
-    if (!isProblemPage()) return toast('请在题目页（/p/…）使用');
+    if (!isProblemPage()) return toast('请在题目页使用');
     if (busy) return toast('正在处理，请稍等');
     const root = findRoot();
     if (!root) return toast('没找到题面容器，请修改 ROOTS');
@@ -572,6 +629,7 @@
         await sleep(300);
       }
       await waitFonts(doc);
+      mirrorFontFaces(doc);
       await waitFonts(document); // html2canvas 在比赛页里测量字体基线，见 waitFonts 的说明
       await sleep(PAGE_SETTLE_MS);
       const root = findRoot(doc);
@@ -600,7 +658,7 @@
       if (!list.length && tid) list = await fetchContestProblems(tid);
       if (!list.length) {
         prog.remove();
-        return toast('没找到题目链接（需要 /p/… 形式的链接）', 4000);
+        return toast('没找到题目链接', 4000);
       }
 
       const contest = safe(getContestTitle(tid));

@@ -1,6 +1,6 @@
 # DMY Better
 
-代码源 newoj（`newoj.daimayuan.top`）的油猴增强脚本。发布在 [Greasy Fork](https://greasyfork.org/zh-CN/scripts/600021-dmy-better)，源码在本仓库。
+代码源 OJ 的油猴增强脚本，支持新 OJ（`newoj.daimayuan.top`）和旧 OJ（`oj.daimayuan.top`，UOJ 系统）。发布在 [Greasy Fork](https://greasyfork.org/zh-CN/scripts/600021-dmy-better)，源码在本仓库。
 
 ## 功能
 
@@ -10,6 +10,13 @@
 - **保存整个比赛**：在比赛页逐题加载并保存，按「比赛名/题号. 题名/」分文件夹。
 
 这三个功能也都在油猴菜单里。
+
+| | 题目页 | 比赛页 |
+| --- | --- | --- |
+| 新 OJ | `/p/<题号>` | `/contest/<id>` |
+| 旧 OJ | `/problem/<题号>`、`/contest/<id>/problem/<题号>` | `/contest/<id>` |
+
+旧 OJ 的公式是 MathJax 渲染的，复制 Markdown 时还原成 `$…$`；「附加文件」保存为 `附加文件.zip`。
 
 ## 安装
 
@@ -22,7 +29,7 @@
 
 ## 配置
 
-题面容器、标题、附件的选择器写在脚本开头的配置区，代码源改版时改那里即可。PDF 的渲染宽度和清晰度也在那里调。
+题面容器（旧 OJ 是 `.uoj-article`）、标题、附件的选择器写在脚本开头的配置区，代码源改版时改那里即可。PDF 的渲染宽度和清晰度也在那里调。
 
 PDF 生成用到 html2canvas 和 jsPDF，通过 `@require` 从 cdnjs 加载；如果安装时提示库下载失败，可能是网络访问不了 cdnjs。
 
