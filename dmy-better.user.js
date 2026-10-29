@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.8.2
+// @version      0.8.3
 // @description  代码源（newoj 和旧 OJ）：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
@@ -199,6 +199,26 @@
     document.body.appendChild(box);
     ta.focus();
     ta.select();
+  }
+
+  // 等 MathJax 排版完（旧 OJ 用 MathJax 2.7）。MathJax 会先用系统字体出一个「预览版」公式，过一会儿才换成
+  // 正式的 TeX 字体版；页面刚加载完就截图会拍到预览版：字体不对、位置偏移。最多等 20 秒。
+  // 判断只看 DOM（脚本运行在隔离环境里，读不到页面里的 MathJax 对象）：
+  // 每个 <script type="math/tex"> 都有对应的 -Frame 输出、预览已清空、没有「Loading…」提示。
+  async function waitMath(doc, timeout = 20000) {
+    if (!doc.querySelector('script[src*="MathJax"], script[type^="math/tex"]')) return;
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const scripts = [...doc.querySelectorAll('script[type^="math/tex"]')];
+      const root = findRoot(doc);
+      const notStarted = !scripts.length && root && /\$|\\\(|\\\[/.test(root.textContent);
+      const pending = scripts.some(sc => !sc.id || !doc.getElementById(sc.id + '-Frame'));
+      const preview = [...doc.querySelectorAll('.MathJax_Preview')].some(p => p.firstElementChild || p.textContent.trim());
+      const msg = doc.getElementById('MathJax_Message');
+      const loading = msg && msg.textContent.trim() && doc.defaultView.getComputedStyle(msg).display !== 'none';
+      if (!notStarted && !pending && !preview && !loading) return;
+      await sleep(300);
+    }
   }
 
   async function waitFonts(doc) {
@@ -688,6 +708,7 @@
       const title = info ? `${info.letter}. ${info.name}` : getTitle();
       const folder = safe(title);
 
+      await waitMath(document);
       await waitFonts(document);
       prog.textContent = `正在生成 PDF：${folder}`;
       const stat = newStat();
@@ -723,6 +744,7 @@
         if (Date.now() - t0 > 20000) throw new Error('等待题面超时，检查 ROOTS');
         await sleep(300);
       }
+      await waitMath(doc);
       await waitFonts(doc);
       await mirrorFontFaces(doc);
       await waitFonts(document); // html2canvas 在比赛页里测量字体基线，见 waitFonts 的说明
