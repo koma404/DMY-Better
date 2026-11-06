@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.8.3
+// @version      0.9.0
 // @description  代码源（newoj 和旧 OJ）：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
 // @supportURL   https://greasyfork.org/zh-CN/scripts/600021-dmy-better
 // @match        https://newoj.daimayuan.top/p/*
 // @match        https://newoj.daimayuan.top/contest/*
+// @match        https://newoj.daimayuan.top/course/*
 // @match        http://oj.daimayuan.top/problem/*
 // @match        http://oj.daimayuan.top/contest/*
 // @match        https://oj.daimayuan.top/problem/*
@@ -20,6 +21,7 @@
 // @noframes
 // @require      https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @run-at       document-start
 // ==/UserScript==
 
@@ -250,6 +252,7 @@
   // 新 OJ：/p/xxx；旧 OJ：/problem/123、/contest/12/problem/123
   const PROBLEM_PATH = /\/(p\/[^/]+|(contest\/\d+\/)?problem\/\d+)\/?$/;
   const isProblemPage = () => PROBLEM_PATH.test(location.pathname);
+  const isCoursePage = () => /^\/course\/[^/]+\/?$/.test(location.pathname);
   const isContestPage = () => /^\/contest\//.test(location.pathname) && !isProblemPage();
 
   /* ================= 3. DOM -> Markdown ================= */
@@ -808,10 +811,151 @@
     }
   }
 
+  /* ================= 10. 课程题单导出 ================= */
+  // 课程可能分多个表格，不能使用比赛列表的第一个表格限制。
+  function courseLinks() {
+    const seen = new Set();
+    const result = [];
+    for (const a of document.querySelectorAll('a[href]')) {
+      let url;
+      try { url = new URL(a.getAttribute('href'), location.href); } catch (e) { continue; }
+      if (url.origin !== location.origin || !/^\/p\/[^/]+\/?$/.test(url.pathname)) continue;
+      const key = url.pathname.replace(/\/$/, '');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push({ url: url.href, name: a.textContent.replace(/\s+/g, ' ').trim() || key.split('/').pop() });
+    }
+    return result;
+  }
+
+  // 加载动态题面，但不等待 PDF 所需的字体和截图延迟。
+  async function loadCourseProblem(url, signal) {
+    const frame = document.createElement('iframe');
+    frame.style.cssText = 'position:fixed;left:-99999px;top:0;width:1280px;height:900px;border:0;opacity:0;pointer-events:none';
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => done(new Error('页面加载超时')), 30000);
+        const done = err => { clearTimeout(timer); signal.removeEventListener('abort', abort); err ? reject(err) : resolve(); };
+        const abort = () => done(new Error('已取消'));
+        signal.addEventListener('abort', abort, { once: true });
+        frame.onload = () => done();
+        frame.onerror = () => done(new Error('页面加载失败'));
+        frame.src = url;
+        document.body.appendChild(frame);
+        if (signal.aborted) abort();
+      });
+      const doc = frame.contentDocument;
+      if (!doc) throw new Error('无法读取题目页面');
+      const start = Date.now();
+      let root;
+      while (!signal.aborted && Date.now() - start < 20000) {
+        root = findRoot(doc);
+        if (root && root.textContent.trim().length > 30) break;
+        root = null;
+        await sleep(200);
+      }
+      if (signal.aborted) throw new Error('已取消');
+      if (!root) throw new Error('等待题面超时，可能需要登录或调整题面选择器');
+      return { frame, doc, root };
+    } catch (e) { frame.remove(); throw e; }
+  }
+
+  async function saveCourse() {
+    if (!isCoursePage()) return toast('请在课程页使用');
+    if (busy) return toast('正在处理，请稍等');
+    if (typeof JSZip === 'undefined') return toast('ZIP 库加载失败，请检查 cdnjs 连接', 8000);
+    const list = courseLinks();
+    if (!list.length) return toast('未找到题目链接，请展开题单或检查是否需要登录', 8000);
+    if (!confirm(`当前页面识别到 ${list.length} 道题。请确认已展开并加载完整题单，是否开始导出？`)) return;
+    busy = true;
+    const controller = new AbortController();
+    const panel = toast('', 1e9);
+    const label = document.createElement('span');
+    const cancel = document.createElement('button');
+    cancel.textContent = '取消';
+    cancel.style.cssText = 'margin-left:12px;cursor:pointer';
+    cancel.onclick = () => { controller.abort(); cancel.disabled = true; label.textContent = '正在取消…'; };
+    panel.append(label, cancel);
+    const zip = new JSZip();
+    const failures = [];
+    const images = new Map();
+    let next = 0, done = 0;
+    const digits = String(list.length).length;
+    const update = () => { label.textContent = `课程导出 ${done}/${list.length}，失败 ${failures.length}`; };
+    async function imagePath(img, problemUrl) {
+      let url;
+      try { url = new URL(img.getAttribute('src'), problemUrl); } catch (e) { return; }
+      if (!/^https?:$/.test(url.protocol)) return;
+      if (!images.has(url.href)) {
+        const imageNumber = images.size + 1;
+        const task = (async () => {
+          const response = await fetch(url.href, { credentials: 'same-origin', signal: controller.signal });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const blob = await response.blob();
+          if (!blob.type.startsWith('image/')) throw new Error('响应不是图片');
+          const ext = (url.pathname.match(/\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i) || [])[1] || ({'image/png':'png','image/jpeg':'jpg','image/svg+xml':'svg','image/gif':'gif','image/webp':'webp'}[blob.type] || 'img');
+          const path = `images/${imageNumber}.${ext}`;
+          zip.file(path, blob);
+          return path;
+        })();
+        images.set(url.href, task);
+      }
+      return images.get(url.href);
+    }
+    async function worker() {
+      while (!controller.signal.aborted) {
+        const i = next++;
+        if (i >= list.length) return;
+        const p = list[i];
+        let frame;
+        try {
+          let loaded;
+          try { loaded = await loadCourseProblem(p.url, controller.signal); }
+          catch (e) {
+            if (controller.signal.aborted) throw e;
+            await sleep(1500);
+            if (controller.signal.aborted) throw e;
+            loaded = await loadCourseProblem(p.url, controller.signal);
+          }
+          frame = loaded.frame;
+          const root = loaded.root;
+          for (const img of root.querySelectorAll('img[src]')) {
+            const original = img.src;
+            try { const path = await imagePath(img, p.url); if (path) img.setAttribute('src', path); }
+            catch (e) { if (controller.signal.aborted) throw e; failures.push(`${i + 1}. ${p.name} 图片 ${original}：${e.message}（保留原链接）`); }
+          }
+          // DOM 的 img.src 会将相对路径解析为页面 URL，转换后再改成 ZIP 内路径。
+          const replacements = [...root.querySelectorAll('img[src^="images/"]')].map(img => [img.src, img.getAttribute('src')]);
+          let text = md(root).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+          for (const [absolute, relative] of replacements) text = text.split(absolute).join(relative);
+          if (!text) throw new Error('题面为空');
+          const title = p.name || `题目${i + 1}`;
+          zip.file(`${String(i + 1).padStart(digits, '0')}. ${safe(title)}.md`, `# ${title}\n\n来源：${p.url}\n\n${text}\n`);
+        } catch (e) {
+          if (!controller.signal.aborted) failures.push(`${i + 1}. ${p.name}：${e.message} (${p.url})`);
+        } finally { if (frame) frame.remove(); done++; update(); }
+      }
+    }
+    try {
+      update();
+      await Promise.all(Array.from({ length: Math.min(4, list.length) }, worker));
+      if (controller.signal.aborted) return toast('课程导出已取消', 5000);
+      if (failures.length) zip.file('导出问题.txt', failures.join('\n') + '\n');
+      label.textContent = '正在打包 ZIP…';
+      cancel.disabled = true;
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const url = URL.createObjectURL(blob);
+      try { await dl(url, safe(document.title || '课程题单') + '.zip', safe(document.title || '课程题单') + '.zip'); }
+      finally { setTimeout(() => URL.revokeObjectURL(url), 60000); }
+      toast(`课程导出完成：处理 ${done} 道，问题 ${failures.length} 项${failures.length ? '，详见 ZIP 内导出问题.txt' : ''}`, 12000);
+    } catch (e) { console.error('[DMY Better] 课程导出失败', e); toast(`课程导出失败：${e.message}`, 10000); }
+    finally { panel.remove(); busy = false; }
+  }
+
   /* ================= 10. 按钮 ================= */
   function tick() {
     if (!document.body) return;
-    const key = (isProblemPage() ? 'p' : '') + (isContestPage() ? 'c' : '');
+    const key = (isProblemPage() ? 'p' : '') + (isContestPage() ? 'c' : '') + (isCoursePage() ? 'course' : '');
     const bar = document.getElementById('__dmy_bar');
     if (bar && bar.dataset.key === key) return;
     if (bar) bar.remove();
@@ -820,6 +964,7 @@
     const items = [];
     if (isProblemPage()) items.push(['复制 MD', copyMarkdown], ['保存题目', savePackage]);
     if (isContestPage()) items.push(['保存整个比赛', saveContest]);
+    if (isCoursePage()) items.push(['保存课程题单', saveCourse]);
 
     const el = document.createElement('div');
     el.id = '__dmy_bar';
@@ -846,5 +991,6 @@
   GM_registerMenuCommand('复制题面为 Markdown', copyMarkdown);
   GM_registerMenuCommand('保存题目（PDF + 附件）', savePackage);
   GM_registerMenuCommand('保存整个比赛', saveContest);
+  GM_registerMenuCommand('保存课程题单（Markdown）', saveCourse);
   GM_registerMenuCommand('调试：字体信息', debugFonts);
 })();
