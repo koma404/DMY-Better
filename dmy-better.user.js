@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.9.1
+// @version      0.9.2
 // @description  代码源（newoj 和旧 OJ）：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
@@ -21,7 +21,6 @@
 // @noframes
 // @require      https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @run-at       document-start
 // ==/UserScript==
 
@@ -854,10 +853,65 @@
     } catch (e) { frame.remove(); throw e; }
   }
 
+  // 标准 ZIP STORE：所有数据先转为字节，再写文件头、目录和 CRC32。
+  // MD 文件很小，无需异步压缩库；避免打包依赖跨沙箱的 Promise/Blob 转换。
+  async function courseZip(files, signal, onProgress) {
+    if (files.size > 65535) throw new Error('ZIP 文件数量超出限制');
+    const encoder = new TextEncoder();
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) c = (c >>> 1) ^ ((c & 1) ? 0xedb88320 : 0);
+      table[i] = c >>> 0;
+    }
+    const parts = [], directory = [];
+    let offset = 0, count = 0, directorySize = 0;
+    const check = () => { if (signal.aborted) throw new Error('已取消'); };
+    for (const [filename, content] of files) {
+      check();
+      const name = encoder.encode(filename);
+      const data = typeof content === 'string' ? encoder.encode(content) : content;
+      if (name.length > 65535 || offset + data.byteLength + name.length + 30 > 0xffffffff)
+        throw new Error('ZIP 超出 4 GiB 限制');
+      let crc = 0xffffffff;
+      for (let i = 0; i < data.length; i++) {
+        crc = (crc >>> 8) ^ table[(crc ^ data[i]) & 255];
+        if (i && i % 1048576 === 0) { await sleep(0); check(); }
+      }
+      crc = (crc ^ 0xffffffff) >>> 0;
+      const header = new Uint8Array(30), h = new DataView(header.buffer);
+      h.setUint32(0, 0x04034b50, true);
+      h.setUint16(4, 20, true); h.setUint16(6, 0x800, true); // UTF-8
+      h.setUint16(12, 0x21, true); // 1980-01-01
+      h.setUint32(14, crc, true);
+      h.setUint32(18, data.byteLength, true); h.setUint32(22, data.byteLength, true);
+      h.setUint16(26, name.length, true);
+      parts.push(header, name, data);
+      const entry = new Uint8Array(46), d = new DataView(entry.buffer);
+      d.setUint32(0, 0x02014b50, true);
+      d.setUint16(4, 20, true); d.setUint16(6, 20, true); d.setUint16(8, 0x800, true);
+      d.setUint16(14, 0x21, true);
+      d.setUint32(16, crc, true);
+      d.setUint32(20, data.byteLength, true); d.setUint32(24, data.byteLength, true);
+      d.setUint16(28, name.length, true); d.setUint32(42, offset, true);
+      directory.push(entry, name);
+      directorySize += entry.length + name.length;
+      offset += header.length + name.length + data.byteLength;
+      onProgress(++count, files.size);
+      await sleep(0); // 让进度和取消按钮能及时响应
+    }
+    check();
+    if (offset + directorySize > 0xffffffff) throw new Error('ZIP 超出 4 GiB 限制');
+    const end = new Uint8Array(22), e = new DataView(end.buffer);
+    e.setUint32(0, 0x06054b50, true);
+    e.setUint16(8, count, true); e.setUint16(10, count, true);
+    e.setUint32(12, directorySize, true); e.setUint32(16, offset, true);
+    return new Blob([...parts, ...directory, end], { type: 'application/zip' });
+  }
+
   async function saveCourse() {
     if (!isCoursePage()) return toast('请在课程页使用');
     if (busy) return toast('正在处理，请稍等');
-    if (typeof JSZip === 'undefined') return toast('ZIP 库加载失败，请检查 cdnjs 连接', 8000);
     const list = courseLinks();
     if (!list.length) return toast('未找到题目链接，请展开题单或检查是否需要登录', 8000);
     if (!confirm(`当前页面识别到 ${list.length} 道题。请确认已展开并加载完整题单，是否开始导出？`)) return;
@@ -870,12 +924,13 @@
     cancel.style.cssText = 'margin-left:12px;cursor:pointer';
     cancel.onclick = () => { controller.abort(); cancel.disabled = true; label.textContent = '正在取消…'; };
     panel.append(label, cancel);
-    const zip = new JSZip();
+    const files = new Map();
+    let keepPanel = false;
     const failures = [];
     const images = new Map();
-    let next = 0, done = 0;
+    let next = 0, done = 0, succeeded = 0, failed = 0;
     const digits = String(list.length).length;
-    const update = () => { label.textContent = `课程导出 ${done}/${list.length}，失败 ${failures.length}`; };
+    const update = () => { label.textContent = `课程导出 v0.9.2：${done}/${list.length}，成功 ${succeeded}，失败 ${failed}`; };
     async function imagePath(img, problemUrl) {
       let url;
       try { url = new URL(img.getAttribute('src'), problemUrl); } catch (e) { return; }
@@ -889,7 +944,7 @@
           if (!blob.type.startsWith('image/')) throw new Error('响应不是图片');
           const ext = (url.pathname.match(/\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i) || [])[1] || ({'image/png':'png','image/jpeg':'jpg','image/svg+xml':'svg','image/gif':'gif','image/webp':'webp'}[blob.type] || 'img');
           const path = `images/${imageNumber}.${ext}`;
-          zip.file(path, await blob.arrayBuffer());
+          files.set(path, new Uint8Array(await blob.arrayBuffer()));
           return path;
         })();
         images.set(url.href, task);
@@ -924,9 +979,10 @@
           for (const [absolute, relative] of replacements) text = text.split(absolute).join(relative);
           if (!text) throw new Error('题面为空');
           const title = p.name || `题目${i + 1}`;
-          zip.file(`${String(i + 1).padStart(digits, '0')}. ${safe(title)}.md`, `# ${title}\n\n来源：${p.url}\n\n${text}\n`);
+          files.set(`${String(i + 1).padStart(digits, '0')}. ${safe(title)}.md`, `# ${title}\n\n来源：${p.url}\n\n${text}\n`);
+          succeeded++;
         } catch (e) {
-          if (!controller.signal.aborted) failures.push(`${i + 1}. ${p.name}：${e.message} (${p.url})`);
+          if (!controller.signal.aborted) { failed++; failures.push(`${i + 1}. ${p.name}：${e.message} (${p.url})`); }
         } finally { if (frame) frame.remove(); done++; update(); }
       }
     }
@@ -934,28 +990,32 @@
       update();
       await Promise.all(Array.from({ length: Math.min(4, list.length) }, worker));
       if (controller.signal.aborted) return toast('课程导出已取消', 5000);
-      if (failures.length) zip.file('导出问题.txt', failures.join('\n') + '\n');
-      label.textContent = '正在打包 ZIP…';
-      cancel.disabled = true;
-      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' }, metadata => {
-        label.textContent = `正在打包 ZIP：${Math.floor(metadata.percent)}%`;
+      if (failures.length) files.set('导出问题.txt', failures.join('\n') + '\n');
+      files.set('导出信息.txt', `DMY Better 0.9.2\n题目 ${list.length}，成功 ${succeeded}，失败 ${failed}，问题 ${failures.length} 项\n来源：${location.href}\n`);
+      label.textContent = '正在打包 ZIP：0%';
+      const blob = await courseZip(files, controller.signal, (n, total) => {
+        label.textContent = `正在打包 ZIP：${n}/${total}（${Math.floor(n / total * 100)}%）`;
       });
       if (controller.signal.aborted) return toast('课程导出已取消', 5000);
       const url = URL.createObjectURL(blob);
-      // blob URL 由当前页面创建，直接交给浏览器下载；GM_download 对它可能不回调。
       const a = document.createElement('a');
       a.href = url;
       a.download = safe(document.title || '课程题单') + '.zip';
-      document.body.appendChild(a);
+      a.textContent = '点击下载 ZIP';
+      a.style.cssText = 'color:#ffce7a;margin-left:12px';
+      panel.appendChild(a);
+      label.textContent = `ZIP 已生成（${(blob.size / 1024).toFixed(0)} KB）：成功 ${succeeded}，失败 ${failed}。若未自动下载，请点击链接。`;
+      cancel.textContent = '关闭';
+      cancel.disabled = false;
+      cancel.onclick = () => { URL.revokeObjectURL(url); panel.remove(); };
+      // 保留链接直到用户关闭，避免自动下载被拦截后只能重新抓题。
+      keepPanel = true;
       a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-      toast(`课程导出完成：处理 ${done} 道，问题 ${failures.length} 项${failures.length ? '，详见 ZIP 内导出问题.txt' : ''}`, 12000);
     } catch (e) {
       if (controller.signal.aborted) toast('课程导出已取消', 5000);
       else { console.error('[DMY Better] 课程导出失败', e); toast(`课程导出失败：${e.message}`, 10000); }
     }
-    finally { panel.remove(); busy = false; }
+    finally { if (!keepPanel) panel.remove(); busy = false; }
   }
 
   /* ================= 10. 按钮 ================= */
