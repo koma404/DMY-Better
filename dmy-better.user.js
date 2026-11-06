@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMY Better
 // @namespace    local.copy-md
-// @version      0.9.0
+// @version      0.9.1
 // @description  代码源（newoj 和旧 OJ）：解除复制限制、复制题面为 Markdown、保存题目（PDF + 附件）、保存整个比赛
 // @author       koma404
 // @homepageURL  https://github.com/koma404/DMY-Better
@@ -833,23 +833,17 @@
     const frame = document.createElement('iframe');
     frame.style.cssText = 'position:fixed;left:-99999px;top:0;width:1280px;height:900px;border:0;opacity:0;pointer-events:none';
     try {
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => done(new Error('页面加载超时')), 30000);
-        const done = err => { clearTimeout(timer); signal.removeEventListener('abort', abort); err ? reject(err) : resolve(); };
-        const abort = () => done(new Error('已取消'));
-        signal.addEventListener('abort', abort, { once: true });
-        frame.onload = () => done();
-        frame.onerror = () => done(new Error('页面加载失败'));
-        frame.src = url;
-        document.body.appendChild(frame);
-        if (signal.aborted) abort();
-      });
-      const doc = frame.contentDocument;
-      if (!doc) throw new Error('无法读取题目页面');
+      frame.src = url;
+      document.body.appendChild(frame);
       const start = Date.now();
-      let root;
-      while (!signal.aborted && Date.now() - start < 20000) {
-        root = findRoot(doc);
+      let root, doc;
+      while (!signal.aborted && Date.now() - start < 30000) {
+        try {
+          doc = frame.contentDocument;
+          // 初始 about:blank 和跳转到登录页都不是目标题目。
+          if (!doc || doc.location.pathname !== new URL(url).pathname) { await sleep(200); continue; }
+          root = findRoot(doc);
+        } catch (e) { throw new Error('无法读取题目页面，可能跳转到登录页'); }
         if (root && root.textContent.trim().length > 30) break;
         root = null;
         await sleep(200);
@@ -889,13 +883,13 @@
       if (!images.has(url.href)) {
         const imageNumber = images.size + 1;
         const task = (async () => {
-          const response = await fetch(url.href, { credentials: 'same-origin', signal: controller.signal });
+          const response = await fetch(url.href, { credentials: 'same-origin', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           const blob = await response.blob();
           if (!blob.type.startsWith('image/')) throw new Error('响应不是图片');
           const ext = (url.pathname.match(/\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i) || [])[1] || ({'image/png':'png','image/jpeg':'jpg','image/svg+xml':'svg','image/gif':'gif','image/webp':'webp'}[blob.type] || 'img');
           const path = `images/${imageNumber}.${ext}`;
-          zip.file(path, blob);
+          zip.file(path, await blob.arrayBuffer());
           return path;
         })();
         images.set(url.href, task);
@@ -943,12 +937,24 @@
       if (failures.length) zip.file('导出问题.txt', failures.join('\n') + '\n');
       label.textContent = '正在打包 ZIP…';
       cancel.disabled = true;
-      const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' }, metadata => {
+        label.textContent = `正在打包 ZIP：${Math.floor(metadata.percent)}%`;
+      });
+      if (controller.signal.aborted) return toast('课程导出已取消', 5000);
       const url = URL.createObjectURL(blob);
-      try { await dl(url, safe(document.title || '课程题单') + '.zip', safe(document.title || '课程题单') + '.zip'); }
-      finally { setTimeout(() => URL.revokeObjectURL(url), 60000); }
+      // blob URL 由当前页面创建，直接交给浏览器下载；GM_download 对它可能不回调。
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = safe(document.title || '课程题单') + '.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
       toast(`课程导出完成：处理 ${done} 道，问题 ${failures.length} 项${failures.length ? '，详见 ZIP 内导出问题.txt' : ''}`, 12000);
-    } catch (e) { console.error('[DMY Better] 课程导出失败', e); toast(`课程导出失败：${e.message}`, 10000); }
+    } catch (e) {
+      if (controller.signal.aborted) toast('课程导出已取消', 5000);
+      else { console.error('[DMY Better] 课程导出失败', e); toast(`课程导出失败：${e.message}`, 10000); }
+    }
     finally { panel.remove(); busy = false; }
   }
 
